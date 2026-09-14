@@ -140,7 +140,7 @@ html,body{
   padding:16px 16px 6px; gap:14px; overflow-y:auto;
 }
 .canvas-wrap{
-  position:relative; width:100%; max-width:420px; aspect-ratio:3/4;
+  position:relative; width:100%; max-width:420px; aspect-ratio:4/3;
   background:#000; border-radius:12px; overflow:hidden;
   touch-action:none;
   display:flex; align-items:center; justify-content:center;
