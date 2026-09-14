@@ -12,92 +12,78 @@ uploads, no backend required.
 2. **Choose edit mode** — edit each photo individually, or batch-process them all the same way.
 3. **Straighten, rotate & crop** — drag to pan, pinch/scroll to zoom, slider to straighten,
    a button to rotate 90°, locked to a 4:3 (landscape) or 3:4 (portrait) crop box. Or tap
-   **Auto crop** to let the app analyze image contrast/edges and position the crop so the
-   main subject lands on a rule-of-thirds intersection, keeping as much of the original
-   image as possible.
-4. **Pick a frame** — 1:1 square (1080×1080px) or 4:5 portrait (1080×1350px) — Instagram's
-   two supported feed dimensions.
+   **Auto crop** for a rule-of-thirds crop that keeps as much of the image as possible.
+4. **Pick a frame** — 1:1 square (1080×1080px) or 4:5 portrait (1080×1350px).
 5. **Pick frame colour** — black or white border.
-6. **Export** — renders full-resolution framed JPEGs and saves/shares them to your photo
-   library.
+6. **Export** — renders full-resolution framed JPEGs and saves/shares them to your library.
 
-## Fixes in this version
+## This update: a structural rewrite of the crop engine
 
-- **Distorted/mis-centered crop fixed.** Previously, a 4:3 photo framed into a 1:1 square
-  could come out with the wrong aspect ratio baked into the exported pixels (visibly
-  stretched) and unevenly split top/bottom margins, instead of filling the full width and
-  sitting centered with equal bars top and bottom.
+Two bugs kept recurring — the cropped photo not filling the full width/height of the frame,
+and the first selected image failing to preview. Both traced back to the same underlying
+design flaw, so this version replaces the crop engine's internals rather than patching
+symptoms:
 
-  The root cause: the crop box's on-screen height was measured independently from the DOM
-  (`clientHeight`), which can drift by a pixel or two from what the declared ratio implies
-  once the browser applies CSS `aspect-ratio` and rounds to whole pixels. When exporting, a
-  single scale factor derived only from width was then applied uniformly to both axes,
-  silently baking that tiny mismatch into a real distortion, and shifting where the crop
-  content landed relative to the frame's center.
+**Before:** the crop was stored as screen-space values (zoom scale, pixel offsets) tied to
+the on-screen crop canvas's measured size at the moment of editing. Exporting meant
+"replaying" those screen-space values onto a differently-sized offscreen canvas using a
+scale factor calculated from a separately-remeasured width. Any tiny mismatch between the
+live canvas's actual size and the value used at replay time (from CSS rounding, layout
+timing, or a stale measurement) got baked into the output as a real distortion or an
+uneven, wrongly-sized crop — which is exactly what caused photos not to fill the frame
+correctly.
 
-  The fix: the crop box's height is now always **derived** as `boxW / ratio` — a fixed
-  formula — and never independently re-measured from the DOM at any point, either on-screen
-  or when rendering to the frame/export canvas. This guarantees the exported photo always has
-  exactly the declared aspect ratio and is placed with mathematically exact centering.
+**Now:** every crop is stored as a single rectangle in the *source image's own pixel
+coordinates* — `{ sx, sy, sw, sh }` — the same representation used for auto-crop. The live
+crop canvas, the frame preview, and the final export all call the exact same drawing
+function with this same rectangle; there is no separate value that gets "replayed" or
+re-derived later, so on-screen and exported results can no longer diverge. Because the
+rectangle's width and height are always kept in exact proportion to the ratio, a single
+scale factor is always mathematically exact on both axes — no possibility of stretch.
 
-- **Frame placement logic confirmed matching the reference:** for a 4:3 crop placed in a 1:1
-  (or 4:5) frame, the photo fills the full width and sits horizontally centered as a block,
-  with equal-height bars above and below. A 3:4 crop follows the identical logic on the other
-  axis — it fills the full height and sits centered with equal-width bars on the left and
-  right. Whichever of the crop's two dimensions is proportionally larger relative to the
-  frame gets filled edge-to-edge; the other dimension is centered with symmetric padding.
-
-- **First-image crop bug fixed** (from a previous round) — the very first image selected
-  used to fail to render on the crop screen due to measuring the canvas before its container
-  was actually visible.
-
-- **4:3 / 3:4 labels fixed** to match their true width:height values.
-
-- **Auto-crop rewritten** to keep as much of the original image as possible while aligning
-  the subject to a rule-of-thirds intersection.
+For the first-image preview bug: the crop canvas used to be sized by measuring the DOM
+right after making its container visible, guessing how many animation frames the browser
+needed to finish layout first. That guess wasn't reliable. It's now driven by a
+`ResizeObserver`, which is specified to fire as soon as an observed element actually has a
+real layout size — including the very first time it becomes visible — so there's no timing
+window where the canvas gets sized to zero.
 
 ## Deploying to GitHub Pages
 
 1. Create a new GitHub repository (e.g. `instaframe`).
-2. Upload all files from the provided zip to the repo root, preserving the `icons/` subfolder:
-   - `index.html`, `styles.css`, `app.js`, `manifest.json`, `sw.js`
-   - `icons/icon-192.png`, `icons/icon-512.png`, `icons/icon-maskable-192.png`,
-     `icons/icon-maskable-512.png`
-3. In the repo, go to **Settings → Pages**, set **Source** to your default branch and root
-   folder (`/`), then save. GitHub Pages serves HTTPS by default, which PWAs require to install.
+2. Upload all files from the provided zip to the repo root, preserving the `icons/` subfolder.
+3. Go to **Settings → Pages**, set **Source** to your default branch and root folder (`/`).
+4. GitHub Pages serves HTTPS by default, which PWAs require to install.
+
+If you have a previously installed version of this app on a device, uninstall and reinstall
+it (or clear its site data) so the new service worker cache takes over — the cache version
+has been bumped so this shouldn't normally be required, but it guarantees a clean update.
 
 ## Installing on Android
 
-1. Open the GitHub Pages URL in **Chrome** on your Android phone.
-2. Chrome shows an **"Add to Home screen" / "Install app"** banner, or tap the **⋮** menu →
-   **Install app**.
-3. Confirm — InstaFrame now appears as a normal app icon, launches full-screen, and works
-   offline after the first load thanks to the service worker cache.
+1. Open the GitHub Pages URL in **Chrome**.
+2. Tap **Install app** from the banner or the **⋮** menu.
+3. InstaFrame launches full-screen and works offline after the first load.
 
 ## How the auto-crop works
 
-1. Finds the largest crop rectangle at your chosen ratio that fits fully inside the source
-   image — no shrink at all, maximum area retained.
-2. Estimates the photo's focal point using an on-device edge/contrast saliency heuristic.
-3. Finds the nearest rule-of-thirds intersection to that focal point.
-4. Slides the full-size crop rectangle so the focal point lands on that intersection, clamped
-   to the image bounds.
-5. Only shrinks the crop if perfect alignment is otherwise impossible, by the minimum amount
-   needed, never below 60% of the maximum possible crop area.
+Finds the largest crop rectangle at your chosen ratio that fits fully inside the source
+image, locates the photo's focal point via an edge/contrast saliency heuristic, and slides
+the crop so that point lands on the nearest rule-of-thirds intersection — shrinking only if
+perfect alignment is otherwise impossible, and never below 60% of the maximum possible area.
 
 ## Customizing
 
-- Colours, spacing, and border radius are CSS variables at the top of `styles.css`.
-- Export resolution is set via `OUT = 1080` in `renderExportScreen()` in `app.js`.
-- The auto-crop shrink floor (`maxShrink`, default `0.6`) is a parameter on
-  `computeAutoCropRect()` in `app.js`.
+- Colours, spacing, border radius: CSS variables at the top of `styles.css`.
+- Export resolution: `OUT = 1080` in `renderExportScreen()` in `app.js`.
+- Auto-crop shrink floor: `maxShrink` parameter (default `0.6`) on `computeAutoCropRect()`.
 
 ## File-by-file overview
 
-- `index.html` — five screens (select, mode, crop, frame, export), toggled via an `active` class.
+- `index.html` — five screens (select, mode, crop, frame, export).
 - `styles.css` — dark, minimal UI.
-- `app.js` — all app logic: file loading, pan/pinch-zoom cropping, saliency-based auto-crop,
-  frame compositing, export/share.
+- `app.js` — file loading, source-space cropping, saliency-based auto-crop, frame
+  compositing, export/share.
 - `manifest.json` — PWA manifest.
 - `sw.js` — service worker for offline install.
 - `icons/` — app icons (regular + maskable, 192px and 512px).

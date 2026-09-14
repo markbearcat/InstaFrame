@@ -1,5 +1,5 @@
 
-const CACHE_NAME = "instaframe-v1";
+const CACHE_NAME = "instaframe-v2";
 const ASSETS = [
   "./",
   "./index.html",

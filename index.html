@@ -79,13 +79,15 @@
     </header>
 
     <main class="crop-stage">
-      <div class="canvas-wrap">
-        <canvas id="cropCanvas"></canvas>
-        <div class="grid-overlay" id="gridOverlay">
-          <div class="grid-line v" style="left:33.333%"></div>
-          <div class="grid-line v" style="left:66.666%"></div>
-          <div class="grid-line h" style="top:33.333%"></div>
-          <div class="grid-line h" style="top:66.666%"></div>
+      <div class="canvas-outer" id="canvasOuter">
+        <div class="canvas-wrap" id="canvasWrap">
+          <canvas id="cropCanvas"></canvas>
+          <div class="grid-overlay" id="gridOverlay">
+            <div class="grid-line v" style="left:33.333%"></div>
+            <div class="grid-line v" style="left:66.666%"></div>
+            <div class="grid-line h" style="top:33.333%"></div>
+            <div class="grid-line h" style="top:66.666%"></div>
+          </div>
         </div>
       </div>
 
