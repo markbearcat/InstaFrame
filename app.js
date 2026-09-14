@@ -8,7 +8,7 @@ const state = {
   files: [],          // { id, img, name }
   mode: 'individual',  // 'individual' | 'batch'
   cropIndex: 0,
-  crops: {},           // id -> { ratio, rotation, offsetX, offsetY, scale }
+  crops: {},           // id -> { ratio, rotation, offsetX, offsetY, scale, boxW }
   frameRatio: 1,        // 1 = square, 1.25 = 4:5
   frameColor: '#ffffff',
   results: []           // id -> dataURL after export
@@ -94,23 +94,35 @@ el('btnModeBatch').addEventListener('click', () => {
   openCropForCurrent();
 });
 
-/* ---------------- STEP 2: CROP / STRAIGHTEN ---------------- */
+/* ---------------- STEP 2: CROP / STRAIGHTEN ----------------
+   crop.ratio is always WIDTH / HEIGHT of the crop box.
+   4:3 (landscape, wider than tall)  -> ratio = 4/3  = 1.3333
+   3:4 (portrait,  taller than wide) -> ratio = 3/4  = 0.75
+
+   IMPORTANT: the crop box's on-screen height is ALWAYS derived as
+   boxW / crop.ratio, never re-measured independently via
+   wrap.clientHeight. CSS aspect-ratio can introduce tiny sub-pixel
+   rounding differences between a measured clientHeight and the
+   mathematically exact boxW/ratio, and replaying transforms later
+   using a mismatched height is what previously caused exported
+   crops to come out visibly stretched/squashed and mis-centered
+   in the frame. Deriving height consistently everywhere removes
+   that entire class of bug.
+------------------------------------------------------------- */
 
 const cropCanvas = el('cropCanvas');
 const cropCtx = cropCanvas.getContext('2d');
-let cropRatio = 0.75; // width/height, 4:3 landscape default (0.75 = 3/4 -> we store as h/w? define below)
-// We'll define ratio as WIDTH/HEIGHT of the crop box.
-// 4:3 button -> landscape-ish crop box width:height = 4:3 -> ratio=1.3333 ... but spec says "sticking to 4:3 or 3:4"
-// seg-btn data-ratio values: 0.75 (=3:4 portrait) and 1.3333 (=4:3 landscape). We'll treat data-ratio as width/height.
 
 let crop = {
-  ratio: 0.75,      // width/height of crop box
-  rotation: 0,       // degrees
-  scale: 1,           // zoom of image within crop
-  offsetX: 0,          // pan in source-image px (at scale=1 baseline)
+  ratio: 1.3333,     // width/height of the crop box — defaults to 4:3 landscape
+  rotation: 0,         // fine straighten, degrees
+  scale: 1,             // zoom of image within crop
+  offsetX: 0,            // pan in screen px, relative to boxW/boxH at save time
   offsetY: 0,
-  minScale: 1
+  minScale: 1,
+  boxW: 0                // crop box width (css px) at the moment this crop was defined
 };
+let hardRotationSteps = 0; // 0..3 hard 90° turns, independent of fine rotation slider
 
 function currentFile(){
   return state.files[state.cropIndex];
@@ -127,23 +139,54 @@ function openCropForCurrent(){
   el('btnCropNext').textContent = (state.mode==='individual' && state.cropIndex < state.files.length-1) ? 'Next' : 'Continue';
 
   const existing = state.crops[f.id];
-  crop = existing ? {...existing} : { ratio: 0.75, rotation: 0, scale: 1, offsetX: 0, offsetY: 0, minScale: 1 };
-  setupCropCanvas();
+  crop = existing ? {...existing} : { ratio: 1.3333, rotation: 0, scale: 1, offsetX: 0, offsetY: 0, minScale: 1, boxW: 0 };
+  hardRotationSteps = existing ? (existing.hardRotationSteps || 0) : 0;
+
+  // Show the crop screen FIRST, before measuring/sizing the canvas. If the screen is still
+  // display:none (as on the very first image), clientWidth/clientHeight read as 0, which
+  // breaks the first image's crop rendering. Showing the screen first lets the browser lay
+  // it out so the wrapper has real dimensions by the time we measure it.
   showScreen('crop');
+  applyBoxAspect();
+
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      setupCropCanvas();
+    });
+  });
+}
+
+function applyBoxAspect(){
+  cropCanvas.parentElement.style.aspectRatio = `${crop.ratio} / 1`;
+}
+
+// The single source of truth for the crop box's CSS pixel dimensions. Height is ALWAYS
+// derived from width via the declared ratio — never independently measured — so it can
+// never drift from what the ratio implies.
+function getBoxDims(boxW){
+  return { boxW, boxH: boxW / crop.ratio };
 }
 
 function setupCropCanvas(){
   const wrap = cropCanvas.parentElement;
   const cssW = wrap.clientWidth;
-  const cssH = wrap.clientHeight;
+
+  if (cssW === 0){
+    requestAnimationFrame(setupCropCanvas);
+    return;
+  }
+
+  const { boxW, boxH } = getBoxDims(cssW);
+  crop.boxW = boxW;
+
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  cropCanvas.width = cssW * dpr;
-  cropCanvas.height = cssH * dpr;
+  cropCanvas.width = boxW * dpr;
+  cropCanvas.height = boxH * dpr;
+  cropCanvas.style.height = boxH + 'px';
   cropCtx.setTransform(dpr,0,0,dpr,0,0);
 
-  // sync ratio buttons UI
   document.querySelectorAll('#screen-crop .seg-btn').forEach(btn => {
-    btn.classList.toggle('active', parseFloat(btn.dataset.ratio) === crop.ratio);
+    btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.ratio) - crop.ratio) < 0.001);
   });
   el('rotateSlider').value = crop.rotation;
   el('rotateValue').textContent = `${crop.rotation}°`;
@@ -155,16 +198,12 @@ function setupCropCanvas(){
 function fitMinScale(){
   const f = currentFile();
   const img = f.img;
-  const wrap = cropCanvas.parentElement;
-  const boxW = wrap.clientWidth;
-  const boxH = wrap.clientHeight; // this represents the crop box area (canvas fills it, ratio letterboxed conceptually)
-  // crop box true aspect = crop.ratio (w/h). The visible canvas area IS the crop box (we always show exactly the crop area, cover-fitted).
-  const rad = crop.rotation * Math.PI/180;
+  if (!crop.boxW) return;
+  const { boxW, boxH } = getBoxDims(crop.boxW);
+  const totalRad = (crop.rotation + hardRotationSteps*90) * Math.PI/180;
   const iw = img.naturalWidth, ih = img.naturalHeight;
-  // bounding box of rotated image
-  const rw = Math.abs(iw*Math.cos(rad)) + Math.abs(ih*Math.sin(rad));
-  const rh = Math.abs(iw*Math.sin(rad)) + Math.abs(ih*Math.cos(rad));
-  // min scale so rotated image covers the crop box (box aspect = crop.ratio, normalize to boxW:boxH pixel canvas)
+  const rw = Math.abs(iw*Math.cos(totalRad)) + Math.abs(ih*Math.sin(totalRad));
+  const rh = Math.abs(iw*Math.sin(totalRad)) + Math.abs(ih*Math.cos(totalRad));
   const coverScale = Math.max(boxW/rw, boxH/rh);
   crop.minScale = coverScale;
   if (crop.scale < coverScale) crop.scale = coverScale;
@@ -173,90 +212,8 @@ function fitMinScale(){
 function drawCrop(){
   const f = currentFile();
   const img = f.img;
-  const wrap = cropCanvas.parentElement;
-  const boxW = wrap.clientWidth;
-  const boxH = wrap.clientHeight;
-
-  cropCtx.clearRect(0,0,boxW,boxH);
-  cropCtx.fillStyle = '#000';
-  cropCtx.fillRect(0,0,boxW,boxH);
-
-  cropCtx.save();
-  cropCtx.translate(boxW/2 + crop.offsetX, boxH/2 + crop.offsetY);
-  cropCtx.rotate(crop.rotation * Math.PI/180);
-  cropCtx.scale(crop.scale, crop.scale);
-  cropCtx.drawImage(img, -img.naturalWidth/2, -img.naturalHeight/2);
-  cropCtx.restore();
-}
-
-// keep canvas box aspect locked to crop.ratio via CSS aspect-ratio on wrapper
-function applyBoxAspect(){
-  cropCanvas.parentElement.style.aspectRatio = `${crop.ratio} / 1`;
-}
-
-window.addEventListener('resize', () => { setupCropCanvas(); });
-
-// ratio toggle
-document.querySelectorAll('#screen-crop .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#screen-crop .seg-btn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    crop.ratio = parseFloat(btn.dataset.ratio);
-    applyBoxAspect();
-    requestAnimationFrame(()=>{ fitMinScale(); drawCrop(); });
-  });
-});
-applyBoxAspect();
-
-// rotation slider
-el('rotateSlider').addEventListener('input', (e) => {
-  crop.rotation = parseFloat(e.target.value);
-  el('rotateValue').textContent = `${crop.rotation}°`;
-  fitMinScale();
-  drawCrop();
-});
-
-el('btnRotate90').addEventListener('click', () => {
-  // swap ratio to emulate 90deg turn visually + rotate image 90
-  crop.rotation = ((crop.rotation + 90 + 45) % 90) - 45 + Math.round(crop.rotation/90)*0; // keep simple: just add 90 then normalize into slider range via separate hard rotation
-  // Simplify: apply a hard 90deg turn independent of slider fine-rotation
-  hardRotate90();
-});
-
-let hardRotationSteps = 0; // 0..3, applied via drawing transform separately from fine rotation
-function hardRotate90(){
-  hardRotationSteps = (hardRotationSteps + 1) % 4;
-  // swap crop ratio to its inverse to match new orientation feel
-  crop.ratio = crop.ratio === 0.75 ? 1.3333 : 0.75;
-  document.querySelectorAll('#screen-crop .seg-btn').forEach(btn => {
-    btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.ratio) - crop.ratio) < 0.001);
-  });
-  applyBoxAspect();
-  requestAnimationFrame(()=>{ fitMinScale(); drawCrop(); });
-}
-
-// Redefine drawCrop/fitMinScale to include hardRotationSteps
-const _origFit = fitMinScale;
-fitMinScale = function(){
-  const f = currentFile();
-  const img = f.img;
-  const wrap = cropCanvas.parentElement;
-  const boxW = wrap.clientWidth;
-  const boxH = wrap.clientHeight;
-  const totalRad = (crop.rotation + hardRotationSteps*90) * Math.PI/180;
-  const iw = img.naturalWidth, ih = img.naturalHeight;
-  const rw = Math.abs(iw*Math.cos(totalRad)) + Math.abs(ih*Math.sin(totalRad));
-  const rh = Math.abs(iw*Math.sin(totalRad)) + Math.abs(ih*Math.cos(totalRad));
-  const coverScale = Math.max(boxW/rw, boxH/rh);
-  crop.minScale = coverScale;
-  if (crop.scale < coverScale) crop.scale = coverScale;
-};
-drawCrop = function(){
-  const f = currentFile();
-  const img = f.img;
-  const wrap = cropCanvas.parentElement;
-  const boxW = wrap.clientWidth;
-  const boxH = wrap.clientHeight;
+  if (!crop.boxW) return;
+  const { boxW, boxH } = getBoxDims(crop.boxW);
 
   cropCtx.clearRect(0,0,boxW,boxH);
   cropCtx.fillStyle = '#000';
@@ -268,7 +225,39 @@ drawCrop = function(){
   cropCtx.scale(crop.scale, crop.scale);
   cropCtx.drawImage(img, -img.naturalWidth/2, -img.naturalHeight/2);
   cropCtx.restore();
-};
+}
+
+window.addEventListener('resize', () => { setupCropCanvas(); });
+
+// ratio toggle (4:3 / 3:4)
+document.querySelectorAll('#screen-crop .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#screen-crop .seg-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    crop.ratio = parseFloat(btn.dataset.ratio);
+    applyBoxAspect();
+    requestAnimationFrame(()=>{ setupCropCanvas(); });
+  });
+});
+
+// rotation slider (fine straighten)
+el('rotateSlider').addEventListener('input', (e) => {
+  crop.rotation = parseFloat(e.target.value);
+  el('rotateValue').textContent = `${crop.rotation}°`;
+  fitMinScale();
+  drawCrop();
+});
+
+// hard 90° rotate — swaps the crop box between 4:3 and 3:4 to match the new orientation
+el('btnRotate90').addEventListener('click', () => {
+  hardRotationSteps = (hardRotationSteps + 1) % 4;
+  crop.ratio = crop.ratio === 1.3333 ? 0.75 : 1.3333;
+  document.querySelectorAll('#screen-crop .seg-btn').forEach(btn => {
+    btn.classList.toggle('active', Math.abs(parseFloat(btn.dataset.ratio) - crop.ratio) < 0.001);
+  });
+  applyBoxAspect();
+  requestAnimationFrame(()=>{ setupCropCanvas(); });
+});
 
 el('btnReset').addEventListener('click', () => {
   crop.rotation = 0;
@@ -287,7 +276,6 @@ el('btnReset').addEventListener('click', () => {
   const wrap = cropCanvas.parentElement;
   let pointers = new Map();
   let lastDist = null;
-  let lastMid = null;
 
   function getPos(e){
     const r = wrap.getBoundingClientRect();
@@ -313,26 +301,23 @@ el('btnReset').addEventListener('click', () => {
     } else if (pointers.size === 2){
       const pts = Array.from(pointers.values());
       const dist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
-      const mid = { x:(pts[0].x+pts[1].x)/2, y:(pts[0].y+pts[1].y)/2 };
       if (lastDist != null){
         const factor = dist / lastDist;
         crop.scale = Math.max(crop.minScale, Math.min(crop.scale * factor, crop.minScale * 6));
       }
       lastDist = dist;
-      lastMid = mid;
       drawCrop();
     }
   });
 
   function clearPointer(e){
     pointers.delete(e.pointerId);
-    if (pointers.size < 2){ lastDist = null; lastMid = null; }
+    if (pointers.size < 2){ lastDist = null; }
   }
   wrap.addEventListener('pointerup', clearPointer);
   wrap.addEventListener('pointercancel', clearPointer);
   wrap.addEventListener('pointerleave', clearPointer);
 
-  // mouse wheel zoom (desktop convenience)
   wrap.addEventListener('wheel', (e) => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.05 : 0.95;
@@ -341,32 +326,27 @@ el('btnReset').addEventListener('click', () => {
   }, { passive:false });
 })();
 
-/* ---- Auto crop: rule-of-thirds via saliency heuristic ---- */
+/* ---------------------------------------------------------------
+   AUTO CROP — rule of thirds, maximum-area heuristic.
+
+   1. Find the largest crop rectangle of the target aspect ratio
+      that fits fully inside the source image (no zoom-in).
+   2. Find the image's focal point via edge/contrast saliency.
+   3. Pick the nearest rule-of-thirds intersection.
+   4. Slide the max-size crop rectangle so that intersection sits
+      under the focal point, clamped to the source image bounds.
+   5. If exact alignment isn't reachable at full size, scan shrink
+      factors and pick the LARGEST factor (least shrink, most area
+      kept) that achieves alignment within tolerance. Never shrink
+      below 60% of the max possible crop area, and never shrink
+      unless it produces a meaningful improvement in alignment.
+------------------------------------------------------------------ */
+
 el('btnAutoCrop').addEventListener('click', () => {
   autoCropCurrent();
 });
 
-function autoCropCurrent(){
-  const f = currentFile();
-  const img = f.img;
-  const iw = img.naturalWidth, ih = img.naturalHeight;
-
-  // Reset fine rotation/hard rotation for auto (assume roughly upright); keep straighten at 0
-  crop.rotation = 0;
-  hardRotationSteps = 0;
-  el('rotateSlider').value = 0;
-  el('rotateValue').textContent = '0°';
-
-  // Analyze a downsampled version to find the "energy" centroid (edges/contrast)
-  const analysis = analyzeSaliency(img);
-  fitMinScale();
-
-  const wrap = cropCanvas.parentElement;
-  const boxW = wrap.clientWidth, boxH = wrap.clientHeight;
-
-  // Determine crop rectangle in source-image space sized to match box aspect at min scale (tightest crop),
-  // then shift so the saliency centroid lands on nearest rule-of-thirds intersection.
-  const targetAspect = crop.ratio; // box w/h
+function computeAutoCropRect(iw, ih, targetAspect, analysis, maxShrink = 0.6){
   let cropW, cropH;
   if (iw/ih > targetAspect){
     cropH = ih;
@@ -376,43 +356,84 @@ function autoCropCurrent(){
     cropH = iw / targetAspect;
   }
 
-  // Slight zoom-in for tighter, more intentional composition (10%)
-  cropW *= 0.92; cropH *= 0.92;
+  const cx = analysis.cx, cy = analysis.cy;
 
-  // centroid in source pixel coords (0..iw, 0..ih)
-  let cx = analysis.cx, cy = analysis.cy;
+  const fracOptionsX = [1/3, 2/3];
+  const fracOptionsY = [1/3, 2/3];
+  const thirdsX = fracOptionsX.map(fr => fr*iw);
+  const thirdsY = fracOptionsY.map(fr => fr*ih);
+  const fracX = Math.abs(thirdsX[0]-cx) < Math.abs(thirdsX[1]-cx) ? fracOptionsX[0] : fracOptionsX[1];
+  const fracY = Math.abs(thirdsY[0]-cy) < Math.abs(thirdsY[1]-cy) ? fracOptionsY[0] : fracOptionsY[1];
 
-  // Choose nearest third-line intersection as the anchor point for the centroid
-  const thirdsX = [iw/3, iw*2/3];
-  const thirdsY = [ih/3, ih*2/3];
-  const nearestX = thirdsX.reduce((a,b)=> Math.abs(b-cx)<Math.abs(a-cx)?b:a);
-  const nearestY = thirdsY.reduce((a,b)=> Math.abs(b-cy)<Math.abs(a-cy)?b:a);
+  function rectAt(factor){
+    const w = cropW*factor, h = cropH*factor;
+    const x = cx - fracX*w, y = cy - fracY*h;
+    const mx = iw-w, my = ih-h;
+    const cxg = Math.max(0, Math.min(x, mx));
+    const cyg = Math.max(0, Math.min(y, my));
+    const actualFracX = w>0 ? (cx-cxg)/w : 0.5;
+    const actualFracY = h>0 ? (cy-cyg)/h : 0.5;
+    const err = Math.abs(actualFracX-fracX) + Math.abs(actualFracY-fracY);
+    return { err, rect: { sx: cxg, sy: cyg, cropW: w, cropH: h } };
+  }
 
-  // We want, within the crop rect, the centroid to sit at the corresponding third.
-  // Determine crop rect top-left (sx, sy) such that (cx-sx)/cropW ≈ (nearestX==thirdsX[0]?1/3:2/3), etc.
-  const fracX = nearestX === thirdsX[0] ? 1/3 : 2/3;
-  const fracY = nearestY === thirdsY[0] ? 1/3 : 2/3;
+  const TOL = 0.02;
+  const full = rectAt(1.0);
+  if (full.err <= TOL){
+    return full.rect;
+  }
 
-  let sx = cx - fracX * cropW;
-  let sy = cy - fracY * cropH;
+  const N = 200;
+  let bestOkFactor = null;
+  let bestAnyErr = full.err;
+  let bestAnyRect = full.rect;
 
-  // clamp within image bounds
-  sx = Math.max(0, Math.min(sx, iw - cropW));
-  sy = Math.max(0, Math.min(sy, ih - cropH));
+  for (let i = 0; i <= N; i++){
+    const factor = maxShrink + (1.0-maxShrink) * (i/N);
+    const { err, rect } = rectAt(factor);
+    if (err <= TOL && (bestOkFactor === null || factor > bestOkFactor)){
+      bestOkFactor = factor;
+    }
+    if (err < bestAnyErr){
+      bestAnyErr = err;
+      bestAnyRect = rect;
+    }
+  }
 
-  // Convert (sx,sy,cropW,cropH) source rect into our transform model (offset + scale)
-  // scale so that cropW maps to boxW (i.e., scale = boxW / cropW), matching box aspect exactly
-  const scale = boxW / cropW;
+  if (bestOkFactor !== null){
+    return rectAt(bestOkFactor).rect;
+  }
+
+  if (full.err - bestAnyErr > 0.05){
+    return bestAnyRect;
+  }
+  return full.rect;
+}
+
+function autoCropCurrent(){
+  const f = currentFile();
+  const img = f.img;
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+
+  crop.rotation = 0;
+  hardRotationSteps = 0;
+  el('rotateSlider').value = 0;
+  el('rotateValue').textContent = '0°';
+
+  const analysis = analyzeSaliency(img);
+  const rect = computeAutoCropRect(iw, ih, crop.ratio, analysis);
+
+  fitMinScale();
+  const { boxW } = getBoxDims(crop.boxW);
+
+  const scale = boxW / rect.cropW;
   crop.scale = Math.max(crop.minScale, scale);
 
-  // center of crop rect in source coords
-  const rectCenterX = sx + cropW/2;
-  const rectCenterY = sy + cropH/2;
-  // image center in source coords
+  const rectCenterX = rect.sx + rect.cropW/2;
+  const rectCenterY = rect.sy + rect.cropH/2;
   const imgCenterX = iw/2;
   const imgCenterY = ih/2;
 
-  // offset needed (in screen px) = -(rectCenter - imgCenter) * scale
   crop.offsetX = -(rectCenterX - imgCenterX) * crop.scale;
   crop.offsetY = -(rectCenterY - imgCenterY) * crop.scale;
 
@@ -421,7 +442,7 @@ function autoCropCurrent(){
 }
 
 function analyzeSaliency(img){
-  const SAMPLE = 120; // analysis resolution
+  const SAMPLE = 120;
   const iw = img.naturalWidth, ih = img.naturalHeight;
   const aspect = iw/ih;
   let sw, sh;
@@ -435,14 +456,12 @@ function analyzeSaliency(img){
   ctx.drawImage(img, 0, 0, sw, sh);
   const data = ctx.getImageData(0,0,sw,sh).data;
 
-  // grayscale
   const gray = new Float32Array(sw*sh);
   for (let i=0;i<sw*sh;i++){
     const r=data[i*4], g=data[i*4+1], b=data[i*4+2];
     gray[i] = 0.299*r + 0.587*g + 0.114*b;
   }
 
-  // simple gradient magnitude (Sobel-ish) as saliency proxy, plus center-bias
   let totalW = 0, sumX = 0, sumY = 0;
   for (let y=1; y<sh-1; y++){
     for (let x=1; x<sw-1; x++){
@@ -451,7 +470,6 @@ function analyzeSaliency(img){
       const gy = gray[idx+sw] - gray[idx-sw];
       let mag = Math.sqrt(gx*gx + gy*gy);
 
-      // mild center bias so busy edges near frame border don't dominate
       const nx = (x/sw - 0.5), ny = (y/sh - 0.5);
       const distFromCenter = Math.sqrt(nx*nx+ny*ny);
       const centerBias = 1 - Math.min(distFromCenter, 0.9) * 0.5;
@@ -471,7 +489,6 @@ function analyzeSaliency(img){
     cy = sumY/totalW;
   }
 
-  // scale centroid back to full-res image coords
   return {
     cx: (cx / sw) * iw,
     cy: (cy / sh) * ih
@@ -508,11 +525,9 @@ el('btnCropNext').addEventListener('click', () => {
 el('btnCropSkipAll').addEventListener('click', () => {
   saveCurrentCrop();
   const template = state.crops[currentFile().id];
-  // apply same relative crop settings to all; auto-crop per image individually if template came from auto,
-  // simplest: just reuse rotation=0/hardRotationSteps + recompute per-image auto-fit at same ratio
   state.files.forEach(f => {
     if (!state.crops[f.id]){
-      state.crops[f.id] = { ratio: template.ratio, rotation: 0, hardRotationSteps: template.hardRotationSteps, scale: 1, offsetX: 0, offsetY: 0, minScale: 1, autoBatch: true };
+      state.crops[f.id] = { ratio: template.ratio, rotation: 0, hardRotationSteps: template.hardRotationSteps, scale: 1, offsetX: 0, offsetY: 0, minScale: 1, boxW: 0, autoBatch: true };
     }
   });
   goToFrameScreen();
@@ -521,11 +536,10 @@ el('btnCropSkipAll').addEventListener('click', () => {
 /* ---------------- STEP 3+4: FRAME RATIO + COLOUR ---------------- */
 
 function goToFrameScreen(){
-  // ensure every file has a crop; batch-autofit any missing
   state.files.forEach(f => {
     if (!state.crops[f.id]){
-      const ref = Object.values(state.crops)[0] || { ratio: 0.75, hardRotationSteps: 0 };
-      state.crops[f.id] = { ratio: ref.ratio, rotation:0, hardRotationSteps: ref.hardRotationSteps||0, scale:1, offsetX:0, offsetY:0, minScale:1, autoBatch:true };
+      const ref = Object.values(state.crops)[0] || { ratio: 1.3333, hardRotationSteps: 0 };
+      state.crops[f.id] = { ratio: ref.ratio, rotation:0, hardRotationSteps: ref.hardRotationSteps||0, scale:1, offsetX:0, offsetY:0, minScale:1, boxW:0, autoBatch:true };
     }
   });
   renderFramePreview();
@@ -556,12 +570,47 @@ function renderFramePreview(){
   const canvas = el('framePreviewCanvas');
   const OUT = 600;
   canvas.width = OUT;
-  canvas.height = Math.round(OUT * state.frameRatio); // frameRatio = height/width factor (1 or 1.25)
+  canvas.height = Math.round(OUT * state.frameRatio);
   renderFramedImage(f, canvas, OUT, canvas.height);
 }
 
-/* Renders the cropped photo (per its saved crop transform) centered into a framed canvas
-   with the frame color as background/border, matching frameRatio (1 = square, 1.25 = 4:5). */
+/* ---------------------------------------------------------------
+   Convert a saved manual crop (scale/offset/rotation, defined
+   relative to its own boxW/boxH at save time) into an explicit
+   source-image-space rectangle wherever possible, OR — if
+   rotation is non-zero — replay the transform directly onto the
+   target canvas using boxW/boxH DERIVED THE SAME WAY they were
+   at save time (never re-measured), so there is never a mismatch
+   between what the user saw and what gets exported.
+------------------------------------------------------------------ */
+function drawManualCropToCanvas(img, targetCtx, targetW, targetH, c){
+  const boxW = c.boxW || targetW;
+  const boxH = boxW / c.ratio; // ALWAYS derived, matches how it was defined on-screen
+
+  // Scale factor from the crop-screen's box size to this target canvas size.
+  // Because boxH is always boxW/ratio and targetH is always targetW/ratio (both canvases
+  // share the same aspect ratio by construction), a single uniform scalar is now exact —
+  // there is no independent height to drift out of proportion.
+  const s = targetW / boxW;
+
+  const totalRot = (c.rotation||0) + (c.hardRotationSteps||0)*90;
+
+  targetCtx.save();
+  targetCtx.translate(targetW/2 + c.offsetX*s, targetH/2 + c.offsetY*s);
+  targetCtx.rotate(totalRot * Math.PI/180);
+  targetCtx.scale(c.scale*s, c.scale*s);
+  targetCtx.drawImage(img, -img.naturalWidth/2, -img.naturalHeight/2);
+  targetCtx.restore();
+}
+
+/* Renders the cropped photo (per its saved crop) centered into a framed canvas with the
+   frame color as background/border, matching frameRatio (1 = square 1080x1080, 1.25 = 4:5
+   portrait 1080x1350 — Instagram's standard feed dimensions).
+
+   Placement rule: the photo fills whichever dimension matches the frame's orientation —
+   for a 4:3 crop (wider than the 1:1/4:5 frame), it fills the FULL WIDTH and is centered
+   vertically (equal top/bottom bars). For a 3:4 crop, the same logic applies on whichever
+   axis is relatively larger. No artificial margin is ever added on the filled axis. */
 function renderFramedImage(f, canvas, outW, outH){
   const ctx = canvas.getContext('2d');
   const c = state.crops[f.id];
@@ -570,67 +619,39 @@ function renderFramedImage(f, canvas, outW, outH){
   ctx.fillStyle = state.frameColor;
   ctx.fillRect(0,0,outW,outH);
 
-  // Determine the crop box aspect (w/h) — this is what fills as much of the frame as possible
-  const cropAspect = c.ratio; // width/height
-  let photoW, photoH;
+  const cropAspect = c.ratio; // width/height of the cropped photo
   const frameAspect = outW/outH;
 
+  let photoW, photoH;
   if (cropAspect > frameAspect){
-    photoW = outW * 0.94;
+    // crop is relatively wider than the frame -> fill full width, letterbox top/bottom
+    photoW = outW;
     photoH = photoW / cropAspect;
   } else {
-    photoH = outH * 0.94;
+    // crop is relatively taller than the frame -> fill full height, pillarbox sides
+    photoH = outH;
     photoW = photoH * cropAspect;
   }
-  const px = (outW - photoW)/2;
-  const py = (outH - photoH)/2;
+  const px = Math.round((outW - photoW)/2);
+  const py = Math.round((outH - photoH)/2);
+  photoW = Math.round(photoW);
+  photoH = Math.round(photoH);
 
-  // Render source image with its crop transform into an offscreen canvas sized photoW x photoH
   const off = document.createElement('canvas');
-  off.width = Math.round(photoW);
-  off.height = Math.round(photoH);
+  off.width = photoW;
+  off.height = photoH;
   const octx = off.getContext('2d');
 
-  const totalRot = (c.rotation||0) + (c.hardRotationSteps||0)*90;
-
   if (c.autoBatch){
-    // compute an auto rule-of-thirds crop fresh for this image at the target aspect
+    const iw = img.naturalWidth, ih = img.naturalHeight;
     const a = analyzeSaliency(img);
-    drawAutoCropToOffscreen(img, off, octx, a, cropAspect);
+    const rect = computeAutoCropRect(iw, ih, cropAspect, a);
+    octx.drawImage(img, rect.sx, rect.sy, rect.cropW, rect.cropH, 0, 0, off.width, off.height);
   } else {
-    // replicate the on-screen crop transform proportionally into the offscreen box
-    const scaleRatio = off.width / (document.getElementById('cropCanvas').parentElement.clientWidth || off.width);
-    octx.save();
-    octx.translate(off.width/2 + c.offsetX*scaleRatio, off.height/2 + c.offsetY*scaleRatio);
-    octx.rotate(totalRot * Math.PI/180);
-    octx.scale(c.scale*scaleRatio, c.scale*scaleRatio);
-    octx.drawImage(img, -img.naturalWidth/2, -img.naturalHeight/2);
-    octx.restore();
+    drawManualCropToCanvas(img, octx, off.width, off.height, c);
   }
 
   ctx.drawImage(off, px, py, photoW, photoH);
-}
-
-function drawAutoCropToOffscreen(img, off, octx, analysis, targetAspect){
-  const iw = img.naturalWidth, ih = img.naturalHeight;
-  let cropW, cropH;
-  if (iw/ih > targetAspect){ cropH = ih; cropW = ih*targetAspect; }
-  else { cropW = iw; cropH = iw/targetAspect; }
-  cropW *= 0.92; cropH *= 0.92;
-
-  let cx = analysis.cx, cy = analysis.cy;
-  const thirdsX = [iw/3, iw*2/3], thirdsY = [ih/3, ih*2/3];
-  const nearestX = thirdsX.reduce((a,b)=> Math.abs(b-cx)<Math.abs(a-cx)?b:a);
-  const nearestY = thirdsY.reduce((a,b)=> Math.abs(b-cy)<Math.abs(a-cy)?b:a);
-  const fracX = nearestX === thirdsX[0] ? 1/3 : 2/3;
-  const fracY = nearestY === thirdsY[0] ? 1/3 : 2/3;
-
-  let sx = cx - fracX*cropW;
-  let sy = cy - fracY*cropH;
-  sx = Math.max(0, Math.min(sx, iw-cropW));
-  sy = Math.max(0, Math.min(sy, ih-cropH));
-
-  octx.drawImage(img, sx, sy, cropW, cropH, 0, 0, off.width, off.height);
 }
 
 el('btnFrameBack').addEventListener('click', () => {
@@ -642,7 +663,11 @@ el('btnFrameNext').addEventListener('click', () => {
   showScreen('export');
 });
 
-/* ---------------- STEP 5: EXPORT ---------------- */
+/* ---------------- STEP 5: EXPORT ----------------
+   Export sizes match Instagram's official 2026 feed recommendations:
+   1:1 square  -> 1080 x 1080 px
+   4:5 portrait -> 1080 x 1350 px (outH = outW * 1.25)
+------------------------------------------------- */
 
 function renderExportScreen(){
   const grid = el('exportGrid');
@@ -663,7 +688,7 @@ function renderExportScreen(){
     grid.appendChild(img);
   });
 
-  el('exportSummary').textContent = `${state.files.length} image${state.files.length===1?'':'s'} ready · ${state.frameRatio===1?'1:1':'4:5'} · ${state.frameColor==='#ffffff'?'White':'Black'} frame`;
+  el('exportSummary').textContent = `${state.files.length} image${state.files.length===1?'':'s'} ready · ${state.frameRatio===1?'1:1 (1080×1080)':'4:5 (1080×1350)'} · ${state.frameColor==='#ffffff'?'White':'Black'} frame`;
 }
 
 el('btnExportBack').addEventListener('click', () => showScreen('frame'));
@@ -688,7 +713,6 @@ async function saveImage(dataUrl, originalName){
   const base = (originalName || 'photo').replace(/\.[^.]+$/, '');
   const filename = `InstaFrame_${base}_${Date.now()}.jpg`;
 
-  // Try native share/save (best UX on Android Chrome/PWA), fallback to download link
   try {
     const blob = await (await fetch(dataUrl)).blob();
     const file = new File([blob], filename, { type: 'image/jpeg' });
